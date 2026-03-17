@@ -9,6 +9,11 @@ on:
         description: "Upstream Frida version to publish. Leave blank for latest."
         required: false
         type: string
+      base_frida_version:
+        description: "Baseline strongR branch used to port patches forward."
+        required: false
+        default: "17.8.2"
+        type: string
       frida_source_ref:
         description: "Branch from RogerAngell99/frida to build. Leave blank for strongr-<version>."
         required: false
@@ -18,12 +23,18 @@ on:
         required: false
         default: false
         type: boolean
+      prepare_only:
+        description: "Prepare/update source branches only, without building or publishing."
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
 
 env:
   EXPECTED_ASSET_COUNT: "12"
+  DEFAULT_STRONGR_BASE_VERSION: "17.8.2"
   DEFAULT_FRIDA_SOURCE_REPO: https://github.com/RogerAngell99/frida.git
   DEFAULT_FRIDA_SOURCE_OWNER: RogerAngell99
   DEFAULT_FRIDA_SOURCE_NAME: frida
@@ -35,6 +46,9 @@ jobs:
       frida_version: ${{ steps.resolve.outputs.frida_version }}
       source_ref: ${{ steps.resolve.outputs.source_ref }}
       should_build: ${{ steps.resolve.outputs.should_build }}
+      should_prepare: ${{ steps.resolve.outputs.should_prepare }}
+      prepare_only: ${{ steps.resolve.outputs.prepare_only }}
+      base_version: ${{ steps.resolve.outputs.base_version }}
       existing_asset_count: ${{ steps.resolve.outputs.existing_asset_count }}
 
     steps:
@@ -43,15 +57,20 @@ jobs:
         uses: actions/github-script@v7
         env:
           REQUESTED_FRIDA_VERSION: ${{ github.event.inputs.frida_version || '' }}
+          REQUESTED_BASE_FRIDA_VERSION: ${{ github.event.inputs.base_frida_version || '' }}
           REQUESTED_FRIDA_SOURCE_REF: ${{ github.event.inputs.frida_source_ref || '' }}
           FORCE_REBUILD: ${{ github.event.inputs.force_rebuild || 'false' }}
+          PREPARE_ONLY: ${{ github.event.inputs.prepare_only || 'false' }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const requestedVersion = (process.env.REQUESTED_FRIDA_VERSION || '').trim();
+            const requestedBaseVersion = (process.env.REQUESTED_BASE_FRIDA_VERSION || '').trim();
             const requestedSourceRef = (process.env.REQUESTED_FRIDA_SOURCE_REF || '').trim();
             const forceRebuild = (process.env.FORCE_REBUILD || '').toLowerCase() === 'true';
+            const prepareOnly = (process.env.PREPARE_ONLY || '').toLowerCase() === 'true';
             const expectedAssetCount = Number(process.env.EXPECTED_ASSET_COUNT || '12');
+            const defaultBaseVersion = process.env.DEFAULT_STRONGR_BASE_VERSION || '17.8.2';
 
             let fridaVersion = requestedVersion;
             if (!fridaVersion) {
@@ -80,44 +99,61 @@ jobs:
             }
 
             const shouldBuild = forceRebuild || !releaseExists || existingAssetCount < expectedAssetCount;
-            const sourceRepoOwner = process.env.DEFAULT_FRIDA_SOURCE_OWNER;
-            const sourceRepoName = process.env.DEFAULT_FRIDA_SOURCE_NAME;
             const sourceRef = requestedSourceRef || `strongr-${fridaVersion}`;
-
-            try {
-              await github.rest.git.getRef({
-                owner: sourceRepoOwner,
-                repo: sourceRepoName,
-                ref: `heads/${sourceRef}`,
-              });
-            } catch (error) {
-              if (error.status === 404) {
-                core.setFailed(
-                  `Missing source branch ${sourceRef} in ${sourceRepoOwner}/${sourceRepoName}. ` +
-                  `Create or pass frida_source_ref before publishing ${fridaVersion}.`
-                );
-                return;
-              }
-              throw error;
-            }
+            const baseVersion = requestedBaseVersion || defaultBaseVersion;
+            const shouldPrepare = prepareOnly || shouldBuild;
 
             core.info(
-              `frida_version=${fridaVersion}, source_ref=${sourceRef}, existing_asset_count=${existingAssetCount}, should_build=${shouldBuild}`
+              `frida_version=${fridaVersion}, base_version=${baseVersion}, source_ref=${sourceRef}, existing_asset_count=${existingAssetCount}, should_prepare=${shouldPrepare}, should_build=${shouldBuild}, prepare_only=${prepareOnly}`
             );
 
             core.setOutput('frida_version', fridaVersion);
+            core.setOutput('base_version', baseVersion);
             core.setOutput('source_ref', sourceRef);
+            core.setOutput('should_prepare', shouldPrepare ? '1' : '0');
             core.setOutput('should_build', shouldBuild ? '1' : '0');
+            core.setOutput('prepare_only', prepareOnly ? '1' : '0');
             core.setOutput('existing_asset_count', String(existingAssetCount));
+
+  prepare_source_branch:
+    runs-on: ubuntu-22.04
+    needs: resolve_version
+    if: needs.resolve_version.outputs.should_prepare == '1'
+    outputs:
+      source_ref: ${{ steps.prepare.outputs.source_ref }}
+      core_ref: ${{ steps.prepare.outputs.core_ref }}
+      prepared: ${{ steps.prepare.outputs.prepared }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Prepare strongR source branches
+        id: prepare
+        env:
+          STRONGR_FORK_TOKEN: ${{ secrets.STRONGR_FORK_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/prepare_strongr_branches.py \
+            --fork-owner "${{ env.DEFAULT_FRIDA_SOURCE_OWNER }}" \
+            --base-version "${{ needs.resolve_version.outputs.base_version }}" \
+            --target-version "${{ needs.resolve_version.outputs.frida_version }}" \
+            --source-ref "${{ github.event.inputs.frida_source_ref || '' }}" \
+            --github-output "$GITHUB_OUTPUT"
 
   build_android:
     runs-on: ubuntu-22.04
-    needs: resolve_version
-    if: needs.resolve_version.outputs.should_build == '1'
+    needs: [resolve_version, prepare_source_branch]
+    if: needs.resolve_version.outputs.should_build == '1' && needs.resolve_version.outputs.prepare_only != '1'
     env:
       FRIDA_VERSION: ${{ needs.resolve_version.outputs.frida_version }}
       FRIDA_SOURCE_REPO: https://github.com/RogerAngell99/frida.git
-      FRIDA_SOURCE_REF: ${{ needs.resolve_version.outputs.source_ref }}
+      FRIDA_SOURCE_REF: ${{ needs.prepare_source_branch.outputs.source_ref }}
 
     steps:
       - uses: actions/checkout@v4
@@ -226,8 +262,8 @@ jobs:
 
   publish_release:
     runs-on: ubuntu-22.04
-    needs: [resolve_version, build_android]
-    if: needs.resolve_version.outputs.should_build == '1' && needs.build_android.result == 'success'
+    needs: [resolve_version, prepare_source_branch, build_android]
+    if: needs.resolve_version.outputs.should_build == '1' && needs.resolve_version.outputs.prepare_only != '1' && needs.build_android.result == 'success'
 
     steps:
       - name: Download packaged assets
