@@ -116,7 +116,7 @@ jobs:
     if: needs.resolve_version.outputs.should_build == '1'
     env:
       FRIDA_VERSION: ${{ needs.resolve_version.outputs.frida_version }}
-      FRIDA_SOURCE_REPO: ${{ env.DEFAULT_FRIDA_SOURCE_REPO }}
+      FRIDA_SOURCE_REPO: https://github.com/RogerAngell99/frida.git
       FRIDA_SOURCE_REF: ${{ needs.resolve_version.outputs.source_ref }}
 
     steps:
